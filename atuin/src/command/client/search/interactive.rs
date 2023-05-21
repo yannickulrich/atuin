@@ -7,7 +7,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent},
     execute, terminal,
 };
-use eyre::Result;
+use eyre::{eyre, Result};
 use futures_util::FutureExt;
 use semver::Version;
 use unicode_width::UnicodeWidthStr;
@@ -47,6 +47,12 @@ struct State {
     engine: Box<dyn SearchEngine>,
 }
 
+pub enum ReturnOption<T> {
+    None,
+    Some(T),
+    SomeAbort(T),
+}
+
 impl State {
     async fn query_results(&mut self, db: &mut dyn Database) -> Result<Vec<History>> {
         let results = self.engine.query(&self.search, db).await?;
@@ -54,16 +60,16 @@ impl State {
         Ok(results)
     }
 
-    fn handle_input(&mut self, settings: &Settings, input: &Event, len: usize) -> Option<usize> {
+    fn handle_input(&mut self, settings: &Settings, input: &Event, len: usize) -> ReturnOption<usize> {
         match input {
             Event::Key(k) => self.handle_key_input(settings, k, len),
             Event::Mouse(m) => self.handle_mouse_input(*m, len),
             Event::Paste(d) => self.handle_paste_input(d),
-            _ => None,
+            _ => ReturnOption::None,
         }
     }
 
-    fn handle_mouse_input(&mut self, input: MouseEvent, len: usize) -> Option<usize> {
+    fn handle_mouse_input(&mut self, input: MouseEvent, len: usize) -> ReturnOption<usize> {
         match input.kind {
             event::MouseEventKind::ScrollDown => {
                 let i = self.results_state.selected().saturating_sub(1);
@@ -75,14 +81,14 @@ impl State {
             }
             _ => {}
         }
-        None
+        ReturnOption::None
     }
 
-    fn handle_paste_input(&mut self, input: &str) -> Option<usize> {
+    fn handle_paste_input(&mut self, input: &str) -> ReturnOption<usize> {
         for i in input.chars() {
             self.search.input.insert(i);
         }
-        None
+        ReturnOption::None
     }
 
     #[allow(clippy::too_many_lines)]
@@ -92,9 +98,9 @@ impl State {
         settings: &Settings,
         input: &KeyEvent,
         len: usize,
-    ) -> Option<usize> {
+    ) -> ReturnOption<usize> {
         if input.kind == event::KeyEventKind::Release {
-            return None;
+            return ReturnOption::None;
         }
 
         let ctrl = input.modifiers.contains(KeyModifiers::CONTROL);
@@ -102,19 +108,23 @@ impl State {
         // reset the state, will be set to true later if user really did change it
         self.switched_search_mode = false;
         match input.code {
-            KeyCode::Char('c' | 'd' | 'g') if ctrl => return Some(RETURN_ORIGINAL),
+            KeyCode::Char('c' | 'd' | 'g') if ctrl => return ReturnOption::Some(RETURN_ORIGINAL),
             KeyCode::Esc => {
-                return Some(match settings.exit_mode {
+                return ReturnOption::SomeAbort(self.results_state.selected());
+                return ReturnOption::Some(match settings.exit_mode {
                     ExitMode::ReturnOriginal => RETURN_ORIGINAL,
                     ExitMode::ReturnQuery => RETURN_QUERY,
                 })
             }
             KeyCode::Enter => {
-                return Some(self.results_state.selected());
+                return ReturnOption::Some(self.results_state.selected());
             }
             KeyCode::Char(c @ '1'..='9') if alt => {
-                let c = c.to_digit(10)? as usize;
-                return Some(self.results_state.selected() + c);
+                if let Some(c) = c.to_digit(10) {
+                    return ReturnOption::Some(self.results_state.selected() + (c as usize));
+                } else {
+                    return ReturnOption::None;
+                }
             }
             KeyCode::Left if ctrl => self
                 .search
@@ -191,7 +201,7 @@ impl State {
                 self.engine = engines::engine(self.search_mode);
             }
             KeyCode::Down if self.results_state.selected() == 0 => {
-                return Some(match settings.exit_mode {
+                return ReturnOption::Some(match settings.exit_mode {
                     ExitMode::ReturnOriginal => RETURN_ORIGINAL,
                     ExitMode::ReturnQuery => RETURN_QUERY,
                 })
@@ -226,7 +236,7 @@ impl State {
             _ => {}
         };
 
-        None
+        ReturnOption::None
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -480,7 +490,7 @@ pub async fn history(
     query: &[String],
     settings: &Settings,
     mut db: impl Database,
-) -> Result<String> {
+) -> Result<(String,bool)> {
     let stdout = Stdout::new(settings.inline_height > 0)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::with_options(
@@ -548,8 +558,10 @@ pub async fn history(
             event_ready = event_ready => {
                 if event_ready?? {
                     loop {
-                        if let Some(i) = app.handle_input(settings, &event::read()?, results.len()) {
-                            break 'render i;
+                        match app.handle_input(settings, &event::read()?, results.len()) {
+                            ReturnOption::Some(i) => { break 'render ReturnOption::Some(i) },
+                            ReturnOption::SomeAbort(i) => { break 'render ReturnOption::SomeAbort(i) },
+                            ReturnOption::None => {},
                         }
                         if !event::poll(Duration::ZERO)? {
                             break;
@@ -574,15 +586,24 @@ pub async fn history(
         terminal.clear()?;
     }
 
-    if index < results.len() {
-        // index is in bounds so we return that entry
-        Ok(results.swap_remove(index).command)
-    } else if index == RETURN_ORIGINAL {
-        Ok(String::new())
-    } else {
-        // Either:
-        // * index == RETURN_QUERY, in which case we should return the input
-        // * out of bounds -> usually implies no selected entry so we return the input
-        Ok(app.search.input.into_inner())
+    match index {
+        ReturnOption::Some(index) if index < results.len() => {
+            // index is in bounds so we return that entry
+            Ok((results.swap_remove(index).command, true))
+        },
+        ReturnOption::Some(index) if index == RETURN_ORIGINAL => { Ok((String::new(),false)) },
+        ReturnOption::Some(_) => {
+            // Either:
+            // * index == RETURN_QUERY, in which case we should return the input
+            // * out of bounds -> usually implies no selected entry so we return the input
+            Ok((app.search.input.into_inner(),true))
+        },
+        ReturnOption::SomeAbort(index) => {
+            // index is in bounds so we return that entry
+            Ok((results.swap_remove(index).command, false))
+        },
+        ReturnOption::None => {
+            Err(eyre!("None"))
+        },
     }
 }
