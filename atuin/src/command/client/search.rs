@@ -129,8 +129,9 @@ impl Cmd {
         settings.shell_up_key_binding = self.shell_up_key_binding;
 
         if self.interactive {
-            let item = interactive::history(&self.query, settings, db).await?;
+            let (item, status) = interactive::history(&self.query, settings, db).await?;
             eprintln!("{item}");
+            if !status {std::process::exit(1);}
         } else {
             let list_mode = ListMode::from_flags(self.human, self.cmd_only);
 
