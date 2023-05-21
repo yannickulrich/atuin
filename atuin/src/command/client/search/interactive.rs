@@ -36,6 +36,12 @@ use crate::{command::client::search::engines, VERSION};
 const RETURN_ORIGINAL: usize = usize::MAX;
 const RETURN_QUERY: usize = usize::MAX - 1;
 
+#[derive(PartialEq)]
+enum MoveMode {
+    Normal,
+    Abort,
+}
+
 struct State {
     history_count: i64,
     update_needed: Option<Version>,
@@ -45,6 +51,8 @@ struct State {
 
     search: SearchState,
     engine: Box<dyn SearchEngine>,
+
+    movemode : MoveMode,
 }
 
 pub enum ReturnOption<T> {
@@ -110,12 +118,14 @@ impl State {
         match input.code {
             KeyCode::Char('c' | 'd' | 'g') if ctrl => return ReturnOption::Some(RETURN_ORIGINAL),
             KeyCode::Esc => {
-                return ReturnOption::SomeAbort(self.results_state.selected());
-                return ReturnOption::Some(match settings.exit_mode {
-                    ExitMode::ReturnOriginal => RETURN_ORIGINAL,
-                    ExitMode::ReturnQuery => RETURN_QUERY,
-                })
-            }
+                return match self.movemode {
+                    MoveMode::Normal => ReturnOption::Some(match settings.exit_mode {
+                        ExitMode::ReturnOriginal => RETURN_ORIGINAL,
+                        ExitMode::ReturnQuery => RETURN_QUERY,
+                    }),
+                    MoveMode::Abort => ReturnOption::SomeAbort(self.results_state.selected())
+                };
+            },
             KeyCode::Enter => {
                 return ReturnOption::Some(self.results_state.selected());
             }
@@ -135,8 +145,11 @@ impl State {
                 .input
                 .prev_word(&settings.word_chars, settings.word_jump_mode),
             KeyCode::Left => {
+                if self.movemode == MoveMode::Abort {
+                    return ReturnOption::SomeAbort(self.results_state.selected());
+                }
                 self.search.input.left();
-            }
+            },
             KeyCode::Char('h') if ctrl => {
                 self.search.input.left();
             }
@@ -151,13 +164,23 @@ impl State {
                 .search
                 .input
                 .next_word(&settings.word_chars, settings.word_jump_mode),
-            KeyCode::Right => self.search.input.right(),
+            KeyCode::Right => {
+                if self.movemode == MoveMode::Abort {
+                    return ReturnOption::SomeAbort(self.results_state.selected());
+                }
+                self.search.input.right()
+            },
             KeyCode::Char('l') if ctrl => self.search.input.right(),
             KeyCode::Char('f') if ctrl => self.search.input.right(),
             KeyCode::Char('a') if ctrl => self.search.input.start(),
             KeyCode::Home => self.search.input.start(),
             KeyCode::Char('e') if ctrl => self.search.input.end(),
-            KeyCode::End => self.search.input.end(),
+            KeyCode::End => {
+                if self.movemode == MoveMode::Abort {
+                    return ReturnOption::SomeAbort(self.results_state.selected());
+                }
+                self.search.input.end();
+            },
             KeyCode::Backspace if ctrl => self
                 .search
                 .input
@@ -534,6 +557,11 @@ pub async fn history(
             },
         },
         engine: engines::engine(settings.search_mode),
+        movemode : if settings.shell_up_key_binding {
+            MoveMode::Abort
+        } else {
+            MoveMode::Normal
+        }
     };
 
     let mut results = app.query_results(&mut db).await?;
