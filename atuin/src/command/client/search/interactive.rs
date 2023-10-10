@@ -7,7 +7,7 @@ use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent},
     execute, terminal,
 };
-use eyre::Result;
+use eyre::{eyre, Result};
 use futures_util::FutureExt;
 use semver::Version;
 use unicode_width::UnicodeWidthStr;
@@ -36,6 +36,12 @@ use ratatui::{
 const RETURN_ORIGINAL: usize = usize::MAX;
 const RETURN_QUERY: usize = usize::MAX - 1;
 
+#[derive(PartialEq)]
+enum MoveMode {
+    Normal,
+    Abort,
+}
+
 struct State {
     history_count: i64,
     update_needed: Option<Version>,
@@ -46,6 +52,14 @@ struct State {
 
     search: SearchState,
     engine: Box<dyn SearchEngine>,
+
+    movemode : MoveMode,
+}
+
+pub enum ReturnOption<T> {
+    None,
+    Some(T),
+    SomeAbort(T),
 }
 
 #[derive(Clone, Copy)]
@@ -63,16 +77,16 @@ impl State {
         Ok(results)
     }
 
-    fn handle_input(&mut self, settings: &Settings, input: &Event) -> Option<usize> {
+    fn handle_input(&mut self, settings: &Settings, input: &Event) -> ReturnOption<usize> {
         match input {
             Event::Key(k) => self.handle_key_input(settings, k),
             Event::Mouse(m) => self.handle_mouse_input(*m),
             Event::Paste(d) => self.handle_paste_input(d),
-            _ => None,
+            _ => ReturnOption::None,
         }
     }
 
-    fn handle_mouse_input(&mut self, input: MouseEvent) -> Option<usize> {
+    fn handle_mouse_input(&mut self, input: MouseEvent) -> ReturnOption<usize> {
         match input.kind {
             event::MouseEventKind::ScrollDown => {
                 self.scroll_down(1);
@@ -82,45 +96,48 @@ impl State {
             }
             _ => {}
         }
-        None
+        ReturnOption::None
     }
 
-    fn handle_paste_input(&mut self, input: &str) -> Option<usize> {
+    fn handle_paste_input(&mut self, input: &str) -> ReturnOption<usize> {
         for i in input.chars() {
             self.search.input.insert(i);
         }
-        None
+        ReturnOption::None
     }
 
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
-    fn handle_key_input(&mut self, settings: &Settings, input: &KeyEvent) -> Option<usize> {
+    fn handle_key_input(&mut self, settings: &Settings, input: &KeyEvent) -> ReturnOption<usize> {
         if input.kind == event::KeyEventKind::Release {
-            return None;
+            return ReturnOption::None;
         }
 
         let ctrl = input.modifiers.contains(KeyModifiers::CONTROL);
         let alt = input.modifiers.contains(KeyModifiers::ALT);
 
-        // Use Ctrl-n instead of Alt-n?
-        let modfr = if settings.ctrl_n_shortcuts { ctrl } else { alt };
-
         // reset the state, will be set to true later if user really did change it
         self.switched_search_mode = false;
         match input.code {
-            KeyCode::Char('c' | 'g') if ctrl => return Some(RETURN_ORIGINAL),
+            KeyCode::Char('c' | 'g') if ctrl => return ReturnOption::Some(RETURN_ORIGINAL),
             KeyCode::Esc => {
-                return Some(match settings.exit_mode {
-                    ExitMode::ReturnOriginal => RETURN_ORIGINAL,
-                    ExitMode::ReturnQuery => RETURN_QUERY,
-                })
-            }
+                return match self.movemode {
+                    MoveMode::Normal => ReturnOption::Some(match settings.exit_mode {
+                        ExitMode::ReturnOriginal => RETURN_ORIGINAL,
+                        ExitMode::ReturnQuery => RETURN_QUERY,
+                    }),
+                    MoveMode::Abort => ReturnOption::SomeAbort(self.results_state.selected())
+                };
+            },
             KeyCode::Enter => {
-                return Some(self.results_state.selected());
+                return ReturnOption::Some(self.results_state.selected());
             }
-            KeyCode::Char(c @ '1'..='9') if modfr => {
-                let c = c.to_digit(10)? as usize;
-                return Some(self.results_state.selected() + c);
+            KeyCode::Char(c @ '1'..='9') if alt => {
+                if let Some(c) = c.to_digit(10) {
+                    return ReturnOption::Some(self.results_state.selected() + (c as usize));
+                } else {
+                    return ReturnOption::None;
+                }
             }
             KeyCode::Left if ctrl => self
                 .search
@@ -131,8 +148,11 @@ impl State {
                 .input
                 .prev_word(&settings.word_chars, settings.word_jump_mode),
             KeyCode::Left => {
+                if self.movemode == MoveMode::Abort {
+                    return ReturnOption::SomeAbort(self.results_state.selected());
+                }
                 self.search.input.left();
-            }
+            },
             KeyCode::Char('h') if ctrl => {
                 self.search.input.left();
             }
@@ -147,13 +167,23 @@ impl State {
                 .search
                 .input
                 .next_word(&settings.word_chars, settings.word_jump_mode),
-            KeyCode::Right => self.search.input.right(),
+            KeyCode::Right => {
+                if self.movemode == MoveMode::Abort {
+                    return ReturnOption::SomeAbort(self.results_state.selected());
+                }
+                self.search.input.right()
+            },
             KeyCode::Char('l') if ctrl => self.search.input.right(),
             KeyCode::Char('f') if ctrl => self.search.input.right(),
             KeyCode::Char('a') if ctrl => self.search.input.start(),
             KeyCode::Home => self.search.input.start(),
             KeyCode::Char('e') if ctrl => self.search.input.end(),
-            KeyCode::End => self.search.input.end(),
+            KeyCode::End => {
+                if self.movemode == MoveMode::Abort {
+                    return ReturnOption::SomeAbort(self.results_state.selected());
+                }
+                self.search.input.end();
+            },
             KeyCode::Backspace if ctrl => self
                 .search
                 .input
@@ -170,7 +200,7 @@ impl State {
             }
             KeyCode::Char('d') if ctrl => {
                 if self.search.input.as_str().is_empty() {
-                    return Some(RETURN_ORIGINAL);
+                    return ReturnOption::Some(RETURN_ORIGINAL);
                 }
                 self.search.input.remove();
             }
@@ -215,13 +245,13 @@ impl State {
                 self.engine = engines::engine(self.search_mode);
             }
             KeyCode::Down if !settings.invert && self.results_state.selected() == 0 => {
-                return Some(match settings.exit_mode {
+                return ReturnOption::Some(match settings.exit_mode {
                     ExitMode::ReturnOriginal => RETURN_ORIGINAL,
                     ExitMode::ReturnQuery => RETURN_QUERY,
                 })
             }
             KeyCode::Up if settings.invert && self.results_state.selected() == 0 => {
-                return Some(match settings.exit_mode {
+                return ReturnOption::Some(match settings.exit_mode {
                     ExitMode::ReturnOriginal => RETURN_ORIGINAL,
                     ExitMode::ReturnQuery => RETURN_QUERY,
                 })
@@ -270,7 +300,7 @@ impl State {
             _ => {}
         };
 
-        None
+        ReturnOption::None
     }
 
     fn scroll_down(&mut self, scroll_len: usize) {
@@ -575,7 +605,7 @@ pub async fn history(
     query: &[String],
     settings: &Settings,
     mut db: impl Database,
-) -> Result<String> {
+) -> Result<(String,bool)> {
     let stdout = Stdout::new(settings.inline_height > 0)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::with_options(
@@ -622,6 +652,11 @@ pub async fn history(
         },
         engine: engines::engine(settings.search_mode),
         results_len: 0,
+        movemode : if settings.shell_up_key_binding {
+            MoveMode::Abort
+        } else {
+            MoveMode::Normal
+        },
     };
 
     let mut results = app.query_results(&mut db).await?;
@@ -639,8 +674,10 @@ pub async fn history(
             event_ready = event_ready => {
                 if event_ready?? {
                     loop {
-                        if let Some(i) = app.handle_input(settings, &event::read()?) {
-                            break 'render i;
+                        match app.handle_input(settings, &event::read()?) {
+                            ReturnOption::Some(i) => { break 'render ReturnOption::Some(i) },
+                            ReturnOption::SomeAbort(i) => { break 'render ReturnOption::SomeAbort(i) },
+                            ReturnOption::None => {},
                         }
                         if !event::poll(Duration::ZERO)? {
                             break;
@@ -665,15 +702,24 @@ pub async fn history(
         terminal.clear()?;
     }
 
-    if index < results.len() {
-        // index is in bounds so we return that entry
-        Ok(results.swap_remove(index).command)
-    } else if index == RETURN_ORIGINAL {
-        Ok(String::new())
-    } else {
-        // Either:
-        // * index == RETURN_QUERY, in which case we should return the input
-        // * out of bounds -> usually implies no selected entry so we return the input
-        Ok(app.search.input.into_inner())
+    match index {
+        ReturnOption::Some(index) if index < results.len() => {
+            // index is in bounds so we return that entry
+            Ok((results.swap_remove(index).command, true))
+        },
+        ReturnOption::Some(index) if index == RETURN_ORIGINAL => { Ok((String::new(),false)) },
+        ReturnOption::Some(_) => {
+            // Either:
+            // * index == RETURN_QUERY, in which case we should return the input
+            // * out of bounds -> usually implies no selected entry so we return the input
+            Ok((app.search.input.into_inner(),true))
+        },
+        ReturnOption::SomeAbort(index) => {
+            // index is in bounds so we return that entry
+            Ok((results.swap_remove(index).command, false))
+        },
+        ReturnOption::None => {
+            Err(eyre!("None"))
+        },
     }
 }
