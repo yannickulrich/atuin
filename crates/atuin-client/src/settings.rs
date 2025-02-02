@@ -455,6 +455,7 @@ pub struct Settings {
     pub search_mode_shell_up_key_binding: Option<SearchMode>,
     pub shell_up_key_binding: bool,
     pub inline_height: u16,
+    pub inline_height_shell_up_key_binding: u16,
     pub invert: bool,
     pub show_preview: bool,
     pub max_preview_height: u16,
@@ -748,6 +749,7 @@ impl Settings {
             .set_default("filter_mode", None::<String>)?
             .set_default("style", "compact")?
             .set_default("inline_height", 40)?
+            .set_default("inline_height_shell_up_key_binding", 0)?
             .set_default("show_preview", true)?
             .set_default("preview.strategy", "auto")?
             .set_default("max_preview_height", 4)?
